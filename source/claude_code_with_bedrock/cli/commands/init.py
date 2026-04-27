@@ -231,6 +231,7 @@ class InitCommand(Command):
 
         # Required checks
         checks = {
+            "AWS CLI installed": self._check_aws_cli(),
             "AWS credentials configured": self._check_aws_credentials(),
             "Python 3.10+ available": self._check_python_version(),
         }
@@ -248,19 +249,6 @@ class InitCommand(Command):
             else:
                 console.print(f"  [red]✗[/red] {check}")
                 all_passed = False
-
-        # AWS CLI is optional: Claude Code itself uses credential-process via
-        # AWS_CREDENTIAL_PROCESS in ~/.claude/settings.json.  The CLI is only
-        # needed here to deploy CloudFormation infrastructure and can be omitted
-        # by teams that use an alternative deployment mechanism.
-        aws_cli_present = self._check_aws_cli()
-        if aws_cli_present:
-            console.print("  [green]✓[/green] AWS CLI installed [dim](used for infrastructure deployment)[/dim]")
-        else:
-            console.print(
-                "  [yellow]⚠[/yellow] AWS CLI not found [dim](optional — only needed for CloudFormation "
-                "deployment; developer packages work without it)[/dim]"
-            )
 
         # Bedrock access is optional (deployment user may not have direct Bedrock permissions)
         if region:
@@ -389,26 +377,6 @@ class InitCommand(Command):
             except Exception:
                 pass  # Continue to manual selection if parsing fails
 
-            # If auto-detection failed (custom domain, Keycloak, PingFederate, etc.)
-            # ask the user to select the provider type manually so deploy never gets None
-            if provider_type is None:
-                console.print(
-                    "\n[yellow]Could not auto-detect provider type from domain.[/yellow]"
-                )
-                provider_type = questionary.select(
-                    "Select your identity provider type:",
-                    choices=[
-                        questionary.Choice("Okta", value="okta"),
-                        questionary.Choice("Microsoft Entra ID / Azure AD", value="azure"),
-                        questionary.Choice("Auth0", value="auth0"),
-                        questionary.Choice("AWS Cognito User Pool", value="cognito"),
-                        questionary.Choice("Generic OIDC (PingFederate, Keycloak, ForgeRock, etc.)", value="generic"),
-                    ],
-                    instruction="(Used to select the correct CloudFormation template)",
-                ).ask()
-                if not provider_type:
-                    return None
-
             # For Cognito, we must ask for the User Pool ID
             # Cannot reliably extract from domain due to case sensitivity
             if provider_type == "cognito":
@@ -442,126 +410,6 @@ class InitCommand(Command):
 
                 if not cognito_user_pool_id:
                     return None
-
-            # Generic OIDC providers (PingFederate, Keycloak, ForgeRock, custom IdP):
-            # we cannot infer endpoint paths or the JWKS thumbprint from the domain,
-            # so we try OIDC discovery first and fall through to manual entry on failure.
-            oidc_issuer_url = None
-            oidc_authorization_endpoint = None
-            oidc_token_endpoint = None
-            oidc_jwks_uri = None
-            oidc_thumbprint = None
-            if provider_type == "generic":
-                from claude_code_with_bedrock.cli.utils.oidc_discovery import (
-                    OidcDiscoveryError,
-                    compute_jwks_thumbprint,
-                    discover_oidc_endpoints,
-                )
-
-                console.print("\n[bold]Generic OIDC Configuration[/bold]")
-                console.print(
-                    "[dim]We'll try to auto-discover endpoints via the standard well-known URL,[/dim]\n"
-                    "[dim]and fall back to manual entry if your IdP doesn't expose one.[/dim]\n"
-                )
-
-                # Construct issuer URL from the domain entered earlier; let the user override.
-                default_issuer = (
-                    provider_domain if provider_domain.startswith(("http://", "https://"))
-                    else f"https://{provider_domain}"
-                ).rstrip("/")
-
-                oidc_issuer_url = questionary.text(
-                    "OIDC issuer URL:",
-                    validate=lambda x: x.startswith("https://") or "Issuer must start with https://",
-                    default=config.get("oidc_issuer_url", default_issuer),
-                    instruction="(must match the 'iss' claim in tokens)",
-                ).ask()
-                if not oidc_issuer_url:
-                    return None
-                oidc_issuer_url = oidc_issuer_url.rstrip("/")
-
-                # Attempt discovery — pre-fill defaults but always let the user confirm/override.
-                discovered: dict[str, str] = {}
-                console.print(f"[dim]Querying {oidc_issuer_url}/.well-known/openid-configuration ...[/dim]")
-                try:
-                    discovered = discover_oidc_endpoints(oidc_issuer_url)
-                    console.print("[green]✓ Discovery succeeded.[/green]")
-                    if discovered.get("issuer") and discovered["issuer"].rstrip("/") != oidc_issuer_url:
-                        console.print(
-                            f"[yellow]Note: discovery reports issuer={discovered['issuer']}, "
-                            f"which differs from {oidc_issuer_url}. Tokens must match the "
-                            f"discovered value.[/yellow]"
-                        )
-                except OidcDiscoveryError as e:
-                    console.print(f"[yellow]Discovery failed: {e}[/yellow]")
-                    console.print("[dim]Falling back to manual entry.[/dim]")
-
-                oidc_authorization_endpoint = questionary.text(
-                    "Authorization endpoint:",
-                    validate=lambda x: bool(x) or "Authorization endpoint cannot be empty",
-                    default=(
-                        discovered.get("authorization_endpoint")
-                        or config.get("oidc_authorization_endpoint")
-                        or f"{oidc_issuer_url}/as/authorization.oauth2"
-                    ),
-                    instruction="(full URL)",
-                ).ask()
-                if not oidc_authorization_endpoint:
-                    return None
-
-                oidc_token_endpoint = questionary.text(
-                    "Token endpoint:",
-                    validate=lambda x: bool(x) or "Token endpoint cannot be empty",
-                    default=(
-                        discovered.get("token_endpoint")
-                        or config.get("oidc_token_endpoint")
-                        or f"{oidc_issuer_url}/as/token.oauth2"
-                    ),
-                    instruction="(full URL)",
-                ).ask()
-                if not oidc_token_endpoint:
-                    return None
-
-                oidc_jwks_uri = questionary.text(
-                    "JWKS URI:",
-                    validate=lambda x: bool(x) or "JWKS URI cannot be empty",
-                    default=(
-                        discovered.get("jwks_uri")
-                        or config.get("oidc_jwks_uri")
-                        or f"{oidc_issuer_url}/pf/JWKS"
-                    ),
-                    instruction="(full URL)",
-                ).ask()
-                if not oidc_jwks_uri:
-                    return None
-
-                # Try to auto-compute the JWKS leaf-cert thumbprint via TLS handshake.
-                # Falls back to manual entry on any failure (firewall, hostname mismatch, etc.).
-                computed_thumbprint = ""
-                console.print(f"[dim]Fetching TLS certificate from {oidc_jwks_uri} ...[/dim]")
-                try:
-                    computed_thumbprint = compute_jwks_thumbprint(oidc_jwks_uri)
-                    console.print(f"[green]✓ Computed thumbprint: {computed_thumbprint}[/green]")
-                except OidcDiscoveryError as e:
-                    console.print(f"[yellow]Could not compute thumbprint automatically: {e}[/yellow]")
-                    console.print(
-                        "[dim]Compute manually with: echo | openssl s_client -servername <host> "
-                        "-connect <host>:443 2>/dev/null | openssl x509 -fingerprint -sha1 -noout[/dim]"
-                    )
-
-                oidc_thumbprint = questionary.text(
-                    "JWKS TLS cert SHA-1 thumbprint:",
-                    validate=lambda x: (
-                        bool(x and len(x.replace(":", "")) == 40 and all(c in "0123456789abcdefABCDEF" for c in x.replace(":", "")))
-                        or "Thumbprint must be 40 hex characters (colons optional)"
-                    ),
-                    default=computed_thumbprint or config.get("oidc_thumbprint", ""),
-                    instruction="(40 hex chars, colons optional — confirm or replace)",
-                ).ask()
-                if not oidc_thumbprint:
-                    return None
-                # Normalize: strip colons, lowercase
-                oidc_thumbprint = oidc_thumbprint.replace(":", "").lower()
 
             client_id = questionary.text(
                 "Enter your OIDC Client ID:",
@@ -669,12 +517,6 @@ class InitCommand(Command):
             config["provider_type"] = provider_type
             if cognito_user_pool_id:
                 config["cognito_user_pool_id"] = cognito_user_pool_id
-            if provider_type == "generic":
-                config["oidc_issuer_url"] = oidc_issuer_url
-                config["oidc_authorization_endpoint"] = oidc_authorization_endpoint
-                config["oidc_token_endpoint"] = oidc_token_endpoint
-                config["oidc_jwks_uri"] = oidc_jwks_uri
-                config["oidc_thumbprint"] = oidc_thumbprint
 
             # Ask about federation type
             console.print("\n[cyan]Federation Type Selection[/cyan]")
@@ -812,12 +654,11 @@ class InitCommand(Command):
                 existing_custom_domain = config["monitoring"].get("custom_domain")
                 existing_zone_id = config["monitoring"].get("hosted_zone_id")
                 already_configured = bool(existing_custom_domain and existing_zone_id)
-                has_existing_domain = bool(existing_custom_domain)
 
-                if has_existing_domain:
+                if already_configured:
                     console.print(f"[dim]Current configuration: {existing_custom_domain}[/dim]")
 
-                enable_https = questionary.confirm("Enable HTTPS with custom domain?", default=has_existing_domain).ask()
+                enable_https = questionary.confirm("Enable HTTPS with custom domain?", default=already_configured).ask()
 
                 if enable_https:
                     custom_domain = questionary.text(
@@ -826,14 +667,8 @@ class InitCommand(Command):
                         default=existing_custom_domain if existing_custom_domain else "",
                     ).ask()
 
-                    # Save the domain immediately — regardless of what happens with
-                    # hosted zone lookup. This is the root cause of "domain never saves":
-                    # previously the domain was only written inside the if hosted_zones
-                    # block, so any Route53 failure silently discarded the user's input.
-                    config["monitoring"]["custom_domain"] = custom_domain
-
                     # Get Route53 hosted zones
-                    hosted_zones, zones_error = self._get_hosted_zones()
+                    hosted_zones = self._get_hosted_zones()
                     if hosted_zones:
                         zone_choices = [
                             f"{zone['Name'].rstrip('.')} ({zone['Id'].split('/')[-1]})" for zone in hosted_zones
@@ -855,23 +690,13 @@ class InitCommand(Command):
 
                         # Extract zone ID
                         zone_id = selected_zone.split("(")[-1].rstrip(")")
+
+                        config["monitoring"]["custom_domain"] = custom_domain
                         config["monitoring"]["hosted_zone_id"] = zone_id
                         console.print(f"[green]✓[/green] HTTPS will be enabled with domain: {custom_domain}")
                     else:
-                        if zones_error:
-                            console.print(f"[yellow]Could not list Route53 hosted zones: {zones_error}[/yellow]")
-                        else:
-                            console.print("[yellow]No Route53 hosted zones found in this account.[/yellow]")
-                        console.print("[dim]Domain saved. Enter the Route53 hosted zone ID manually:[/dim]")
-                        manual_zone_id = questionary.text(
-                            "Hosted Zone ID (e.g., Z1234ABCDEFGH, leave blank to set later):",
-                            default=existing_zone_id if existing_zone_id else "",
-                        ).ask()
-                        if manual_zone_id and manual_zone_id.strip():
-                            config["monitoring"]["hosted_zone_id"] = manual_zone_id.strip()
-                            console.print(f"[green]✓[/green] HTTPS configured: {custom_domain} (zone: {manual_zone_id.strip()})")
-                        else:
-                            console.print(f"[yellow]⚠[/yellow] Domain saved but no zone ID set. Update before deploying.")
+                        console.print("[yellow]No Route53 hosted zones found. HTTPS requires a hosted zone.[/yellow]")
+                        console.print("[dim]You can add these parameters manually during deployment.[/dim]")
                 else:
                     # User disabled HTTPS, clear any existing config
                     config["monitoring"]["custom_domain"] = None
@@ -1470,118 +1295,8 @@ class InitCommand(Command):
                 f"Cross-Region ({profile_description})"
             )
 
-            # Optional: Application Inference Profiles
-            has_saved_arns = any(
-                config.get("aws", {}).get(k)
-                for k in ["inference_profile_opus_arn", "inference_profile_sonnet_arn", "inference_profile_haiku_arn"]
-            )
-            use_inference_profiles = questionary.confirm(
-                "Configure Application Inference Profiles?",
-                default=has_saved_arns,
-            ).ask()
-
-            if use_inference_profiles:
-                from claude_code_with_bedrock.validators import ProfileValidator
-
-                console.print("[dim]Provide an inference profile ARN for each model tier (press Enter to skip).[/dim]")
-
-                for tier_name, config_key in [
-                    ("Opus", "inference_profile_opus_arn"),
-                    ("Sonnet", "inference_profile_sonnet_arn"),
-                    ("Haiku", "inference_profile_haiku_arn"),
-                ]:
-                    saved_arn = config.get("aws", {}).get(config_key)
-                    while True:
-                        arn = questionary.text(
-                            f"  {tier_name} inference profile ARN:",
-                            default=saved_arn or "",
-                        ).ask()
-
-                        if arn is None:  # User cancelled
-                            config["aws"][config_key] = None
-                            break
-
-                        if not arn.strip():
-                            config["aws"][config_key] = None
-                            break
-
-                        error = ProfileValidator.validate_application_inference_profile_arn(arn)
-                        if error:
-                            console.print(f"[red]{error}[/red]")
-                            continue
-
-                        config["aws"][config_key] = arn.strip()
-                        console.print(f"[green]✓[/green] {tier_name} inference profile configured")
-                        break
-            else:
-                config["aws"]["inference_profile_opus_arn"] = None
-                config["aws"]["inference_profile_sonnet_arn"] = None
-                config["aws"]["inference_profile_haiku_arn"] = None
-
             # Save progress
             progress.save_step("bedrock_complete", config)
-
-        # Resource Tags (optional)
-        console.print("\n[bold blue]Resource Tags (Optional)[/bold blue]")
-        console.print("─" * 30)
-        console.print("[dim]Tags are applied to all deployed CloudFormation stacks.[/dim]")
-
-        add_tags = questionary.confirm(
-            "Would you like to add resource tags?",
-            default=bool(config.get("tags")),
-        ).ask()
-
-        if add_tags:
-            existing_tags = dict(config.get("tags", {}))
-            tags = {}
-
-            # Let user confirm/edit existing tags first
-            if existing_tags:
-                console.print("[dim]Existing tags (edit value or leave empty to remove):[/dim]")
-                for key, value in existing_tags.items():
-                    tag_value = questionary.text(
-                        f"  {key}:",
-                        default=value,
-                    ).ask()
-                    if tag_value is None:
-                        return None
-                    if tag_value:
-                        tags[key] = tag_value
-                        console.print(f"[green]✓[/green] Tag: {key}={tag_value}")
-                    else:
-                        console.print(f"[yellow]✗[/yellow] Removed tag: {key}")
-
-            # Then allow adding new tags
-            while True:
-                tag_key = questionary.text(
-                    "New tag key (empty to finish):",
-                    default="",
-                ).ask()
-                tag_key = (tag_key or "").strip()
-                if not tag_key:
-                    break
-                if tag_key.lower().startswith("aws:"):
-                    console.print("[red]✗ Tag keys cannot start with 'aws:' (reserved by AWS)[/red]")
-                    continue
-                if len(tag_key) > 128:
-                    console.print("[red]✗ Tag key exceeds 128 character limit[/red]")
-                    continue
-                tag_value = questionary.text(
-                    f"Value for '{tag_key}':",
-                    default=tags.get(tag_key, ""),
-                ).ask()
-                if tag_value is None:
-                    break
-                if len(tag_value) > 256:
-                    console.print("[red]✗ Tag value exceeds 256 character limit[/red]")
-                    continue
-                tags[tag_key] = tag_value
-                console.print(f"[green]✓[/green] Tag: {tag_key}={tag_value}")
-            config["tags"] = tags
-        elif add_tags is None:
-            return None
-        else:
-            config["tags"] = config.get("tags", {})
 
         return config
 
@@ -1607,7 +1322,6 @@ class InitCommand(Command):
                 else config["okta"]["client_id"]
             ),
         )
-
         table.add_row(
             "Credential Storage",
             (
@@ -1656,12 +1370,6 @@ class InitCommand(Command):
         if selected_model:
             table.add_row("Claude Model", model_display.get(selected_model, selected_model))
 
-        # Show application inference profiles if configured
-        for tier, key in [("Opus", "inference_profile_opus_arn"), ("Sonnet", "inference_profile_sonnet_arn"), ("Haiku", "inference_profile_haiku_arn")]:
-            arn = config["aws"].get(key)
-            if arn:
-                table.add_row(f"{tier} Inference Profile", arn)
-
         # Show cross-region profile
         cross_region_profile = config["aws"].get("cross_region_profile", "us")
         profile_display = {
@@ -1677,10 +1385,6 @@ class InitCommand(Command):
             table.add_row("AWS Account", account_id)
         else:
             table.add_row("AWS Account", "[yellow]Unable to determine[/yellow]")
-
-        # Show resource tags
-        if config.get("tags"):
-            table.add_row("Resource Tags", ", ".join(f"{k}={v}" for k, v in config["tags"].items()))
 
         console.print(table)
 
@@ -1711,14 +1415,7 @@ class InitCommand(Command):
             if dist_type == "landing-page":
                 console.print("• Authenticated landing page distribution (ALB + Lambda + S3)")
                 idp_provider = config.get("distribution", {}).get("idp_provider", "")
-                idp_display_names = {
-                    "okta": "Okta",
-                    "azure": "Azure AD / Entra ID",
-                    "auth0": "Auth0",
-                    "cognito": "AWS Cognito User Pool",
-                }
-                idp_label = idp_display_names.get(idp_provider, idp_provider.upper() if idp_provider else "configured")
-                console.print(f"• IdP authentication: {idp_label}")
+                console.print(f"• IdP authentication: {idp_provider.upper() if idp_provider else 'configured'}")
                 if config.get("distribution", {}).get("custom_domain"):
                     console.print(f"• Custom domain: {config['distribution']['custom_domain']}")
             elif dist_type == "presigned-s3":
@@ -1873,16 +1570,8 @@ class InitCommand(Command):
             cross_region_profile=config_data["aws"].get("cross_region_profile", "us"),
             selected_model=config_data["aws"].get("selected_model"),
             selected_source_region=config_data["aws"].get("selected_source_region"),
-            inference_profile_opus_arn=config_data["aws"].get("inference_profile_opus_arn"),
-            inference_profile_sonnet_arn=config_data["aws"].get("inference_profile_sonnet_arn"),
-            inference_profile_haiku_arn=config_data["aws"].get("inference_profile_haiku_arn"),
             provider_type=config_data.get("provider_type"),
             cognito_user_pool_id=config_data.get("cognito_user_pool_id"),
-            oidc_issuer_url=config_data.get("oidc_issuer_url"),
-            oidc_authorization_endpoint=config_data.get("oidc_authorization_endpoint"),
-            oidc_token_endpoint=config_data.get("oidc_token_endpoint"),
-            oidc_jwks_uri=config_data.get("oidc_jwks_uri"),
-            oidc_thumbprint=config_data.get("oidc_thumbprint"),
             federation_type=config_data.get("federation_type", "cognito"),
             max_session_duration=config_data.get("max_session_duration", 28800),
             sso_enabled=config_data.get("sso_enabled", True),
@@ -1912,7 +1601,6 @@ class InitCommand(Command):
             monthly_enforcement_mode=config_data.get("quota", {}).get("monthly_enforcement_mode", "block"),
             quota_check_interval=config_data.get("quota", {}).get("check_interval", 30),
             cowork_3p_enabled=config_data.get("cowork_3p", {}).get("enabled", True),
-            tags=config_data.get("tags", {}),
         )
 
         config.add_profile(profile)
@@ -1932,24 +1620,10 @@ class InitCommand(Command):
 
     def _check_aws_credentials(self) -> bool:
         """Check if AWS credentials are configured."""
-        console = Console()
         try:
             boto3.client("sts").get_caller_identity()
             return True
-        except Exception as e:
-            err = str(e)
-            console.print(f"    [dim red]Credential error: {err}[/dim red]")
-            if "ExpiredToken" in err or "expired" in err.lower():
-                console.print(
-                    "    [dim]Hint: Expired credentials in ~/.aws/credentials are blocking the EC2 instance role.\n"
-                    "    Run: [cyan]unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN[/cyan]\n"
-                    "    Then clear the [default] section from ~/.aws/credentials and retry.[/dim]"
-                )
-            elif "NoCredentialProviders" in err or "Unable to locate credentials" in err:
-                console.print(
-                    "    [dim]Hint: No credentials found. Configure via env vars, ~/.aws/credentials,\n"
-                    "    an IAM instance profile, or AWS SSO.[/dim]"
-                )
+        except Exception:
             return False
 
     def _check_python_version(self) -> bool:
@@ -2200,17 +1874,6 @@ class InitCommand(Command):
             if hasattr(profile, "cognito_user_pool_id") and profile.cognito_user_pool_id:
                 existing_config["cognito_user_pool_id"] = profile.cognito_user_pool_id
 
-            # Add Generic OIDC fields if present
-            for oidc_field in (
-                "oidc_issuer_url",
-                "oidc_authorization_endpoint",
-                "oidc_token_endpoint",
-                "oidc_jwks_uri",
-                "oidc_thumbprint",
-            ):
-                if getattr(profile, oidc_field, None):
-                    existing_config[oidc_field] = getattr(profile, oidc_field)
-
             # Add selected model if present
             if hasattr(profile, "selected_model") and profile.selected_model:
                 existing_config["aws"]["selected_model"] = profile.selected_model
@@ -2218,11 +1881,6 @@ class InitCommand(Command):
             # Add cross-region profile if present
             if hasattr(profile, "cross_region_profile") and profile.cross_region_profile:
                 existing_config["aws"]["cross_region_profile"] = profile.cross_region_profile
-
-            # Add application inference profile ARNs if present
-            for arn_key in ["inference_profile_opus_arn", "inference_profile_sonnet_arn", "inference_profile_haiku_arn"]:
-                if getattr(profile, arn_key, None):
-                    existing_config["aws"][arn_key] = getattr(profile, arn_key)
 
             # Add CodeBuild configuration if present
             if hasattr(profile, "enable_codebuild"):
@@ -2269,10 +1927,6 @@ class InitCommand(Command):
             if hasattr(profile, "selected_source_region") and profile.selected_source_region:
                 existing_config["aws"]["selected_source_region"] = profile.selected_source_region
 
-            # Add resource tags if present
-            if hasattr(profile, "tags") and profile.tags:
-                existing_config["tags"] = profile.tags
-
             return existing_config
 
         except Exception:
@@ -2301,12 +1955,6 @@ class InitCommand(Command):
             from claude_code_with_bedrock.models import get_all_model_display_names
             model_names = get_all_model_display_names()
             console.print(f"• Claude Model: [cyan]{model_names.get(selected_model, selected_model)}[/cyan]")
-
-        # Show application inference profiles if configured
-        for tier, key in [("Opus", "inference_profile_opus_arn"), ("Sonnet", "inference_profile_sonnet_arn"), ("Haiku", "inference_profile_haiku_arn")]:
-            arn = config["aws"].get(key)
-            if arn:
-                console.print(f"• {tier} Inference Profile: [cyan]{arn}[/cyan]")
 
         # Show cross-region profile
         cross_region_profile = config["aws"].get("cross_region_profile", "us")
@@ -2375,21 +2023,16 @@ class InitCommand(Command):
         except Exception:
             return {}
 
-    def _get_hosted_zones(self) -> tuple[list[dict[str, Any]], str | None]:
-        """Get available Route53 hosted zones.
-
-        Returns:
-            Tuple of (zones list, error message or None).
-            On success: (zones, None). On failure: ([], error_string).
-        """
+    def _get_hosted_zones(self) -> list[dict[str, Any]]:
+        """Get available Route53 hosted zones."""
         try:
             import boto3
 
             client = boto3.client("route53")
             response = client.list_hosted_zones()
-            return response.get("HostedZones", []), None
-        except Exception as e:
-            return [], str(e)
+            return response.get("HostedZones", [])
+        except Exception:
+            return []
 
     def _configure_vpc(self, region: str, existing_vpc_config: dict[str, Any] = None) -> dict[str, Any]:
         """Configure VPC for monitoring stack."""

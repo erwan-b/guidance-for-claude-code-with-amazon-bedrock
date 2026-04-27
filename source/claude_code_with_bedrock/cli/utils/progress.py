@@ -74,8 +74,10 @@ class WizardProgress:
         step = self.get_last_step()
 
         summary_parts = []
-        if step in ["oidc_complete", "aws_complete", "monitoring_complete", "bedrock_complete"]:
-            summary_parts.append(f"✓ OIDC Provider: {data.get('okta', {}).get('domain', 'Not set')}")
+        if step == "okta_complete":
+            summary_parts.append(f"✓ Okta: {data.get('okta', {}).get('domain', 'Not set')}")
+        if step in ["aws_complete", "monitoring_complete", "bedrock_complete"]:
+            summary_parts.append(f"✓ Okta: {data.get('okta', {}).get('domain', 'Not set')}")
             summary_parts.append(f"✓ AWS Region: {data.get('aws', {}).get('region', 'Not set')}")
         if step == "monitoring_complete":
             summary_parts.append(
