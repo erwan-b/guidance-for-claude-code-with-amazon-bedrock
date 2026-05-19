@@ -3,10 +3,15 @@
 
 """AWS utilities for CLI commands."""
 
+import logging
+
 from typing import Any
 
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
+
+
+logger = logging.getLogger(__name__)
 
 
 def get_current_region() -> str | None:
@@ -99,8 +104,14 @@ def get_stack_outputs(stack_name: str, region: str) -> dict[str, str]:
             outputs[output["OutputKey"]] = output["OutputValue"]
 
         return outputs
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ValidationError":
+            logger.debug("Stack %s not found in %s when fetching outputs", stack_name, region)
+            return {}
+        logger.debug("Error getting stack outputs for %s in %s: %s", stack_name, region, e)
+        return {}
     except Exception as e:
-        print(f"Error getting stack outputs: {e}")
+        logger.debug("Unexpected error getting stack outputs for %s in %s: %s", stack_name, region, e)
         return {}
 
 
@@ -112,6 +123,23 @@ def get_account_id() -> str | None:
         return response["Account"]
     except Exception:
         return None
+
+
+def check_s3_bucket_exists(bucket_name: str, region: str) -> bool:
+    """Check whether an S3 bucket exists and is reachable."""
+    try:
+        client = boto3.client("s3", region_name=region)
+        client.head_bucket(Bucket=bucket_name)
+        return True
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code", "")
+        if error_code in {"404", "NoSuchBucket", "NotFound"}:
+            return False
+        logger.debug("Error checking S3 bucket %s in %s: %s", bucket_name, region, e)
+        return False
+    except Exception as e:
+        logger.debug("Unexpected error checking S3 bucket %s in %s: %s", bucket_name, region, e)
+        return False
 
 
 def validate_iam_permissions() -> dict[str, bool]:

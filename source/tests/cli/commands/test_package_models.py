@@ -3,6 +3,7 @@
 
 """Tests for model handling in the package command."""
 
+import json
 import tempfile
 from pathlib import Path
 
@@ -73,3 +74,39 @@ class TestPackageModelHandling:
                 assert "eu-west-1" in expected_display
             elif profile_key == "apac":
                 assert "ap-northeast-1" in expected_display
+
+    def test_non_sso_monitoring_does_not_force_anonymous_otel(self, monkeypatch):
+        """Non-SSO packages should still allow IAM-based user attribution in OTEL helper."""
+        command = PackageCommand()
+
+        profile = Profile(
+            name="test",
+            provider_domain="none",
+            client_id="none",
+            credential_storage="session",
+            aws_region="eu-west-3",
+            identity_pool_name="test-pool",
+            monitoring_enabled=True,
+            sso_enabled=False,
+        )
+
+        class FakeCompletedProcess:
+            returncode = 0
+            stdout = '[{"OutputKey":"CollectorEndpoint","OutputValue":"http://collector.example.com"}]'
+
+        monkeypatch.setattr(
+            "claude_code_with_bedrock.cli.commands.package.subprocess.run",
+            lambda *args, **kwargs: FakeCompletedProcess(),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            command._create_claude_settings(output_dir, profile, profile_name="test-profile")
+
+            settings_path = output_dir / "claude-settings" / "settings.json"
+            with open(settings_path) as f:
+                settings = json.load(f)
+
+            assert settings["env"]["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
+            assert settings["env"]["AWS_PROFILE"] == "__AWS_PROFILE_NAME__"
+            assert "CLAUDE_CODE_OTEL_ANONYMOUS" not in settings["env"]

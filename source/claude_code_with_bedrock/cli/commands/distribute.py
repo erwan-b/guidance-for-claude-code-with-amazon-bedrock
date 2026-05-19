@@ -13,6 +13,7 @@ from pathlib import Path
 
 import boto3
 from boto3.s3.transfer import TransferConfig
+from botocore.config import Config as BotocoreConfig
 from botocore.exceptions import ClientError
 from cleo.commands.command import Command
 from cleo.helpers import option
@@ -20,7 +21,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.progress import BarColumn, DownloadColumn, Progress, SpinnerColumn, TextColumn, TimeRemainingColumn
 
-from claude_code_with_bedrock.cli.utils.aws import get_stack_outputs
+from claude_code_with_bedrock.cli.utils.aws import check_s3_bucket_exists, get_stack_outputs
 from claude_code_with_bedrock.config import Config
 
 
@@ -318,9 +319,8 @@ class DistributeCommand(Command):
 
         # Check if distribution is enabled and stack is deployed
         if profile.enable_distribution:
-            dist_stack_name = profile.stack_names.get("distribution", f"{profile.identity_pool_name}-distribution")
             try:
-                dist_outputs = get_stack_outputs(dist_stack_name, profile.aws_region)
+                dist_outputs = self._get_distribution_stack_outputs(profile)
                 if not dist_outputs:
                     console.print("[red]Distribution stack not deployed.[/red]")
                     console.print("Deploy the distribution stack first:")
@@ -420,6 +420,52 @@ class DistributeCommand(Command):
                 console.print(f"[red]Error retrieving URL: {e}[/red]")
             return 1
 
+    def _get_distribution_stack_outputs(self, profile) -> dict[str, str]:
+        """Fetch and validate distribution stack outputs."""
+        dist_stack_name = profile.stack_names.get("distribution", f"{profile.identity_pool_name}-distribution")
+        stack_outputs = get_stack_outputs(dist_stack_name, profile.aws_region)
+        if not stack_outputs:
+            raise ValueError("Distribution stack not deployed.")
+
+        bucket_name = stack_outputs.get("DistributionBucket")
+        if not bucket_name:
+            raise ValueError("S3 bucket not found in distribution stack outputs.")
+
+        if not check_s3_bucket_exists(bucket_name, profile.aws_region):
+            raise ValueError(
+                f"Distribution bucket does not exist: {bucket_name}. "
+                "The distribution stack appears drifted. Delete and redeploy the distribution stack."
+            )
+
+        return stack_outputs
+
+    def _create_distribution_presign_client(self, profile, stack_outputs: dict[str, str]):
+        """Create an S3 client using the dedicated distribution IAM user credentials."""
+        secret_id = stack_outputs.get("DistributionSecretArn") or stack_outputs.get("DistributionSecretName")
+        if not secret_id:
+            raise ValueError("Distribution credentials secret not found in stack outputs.")
+
+        secrets = boto3.client("secretsmanager", region_name=profile.aws_region)
+        response = secrets.get_secret_value(SecretId=secret_id)
+        secret_string = response.get("SecretString")
+        if not secret_string:
+            raise ValueError("Distribution credentials secret is empty.")
+
+        secret_data = json.loads(secret_string)
+        access_key_id = secret_data.get("AccessKeyId")
+        secret_access_key = secret_data.get("SecretAccessKey")
+        if not access_key_id or not secret_access_key:
+            raise ValueError("Distribution credentials secret is missing required keys.")
+
+        return boto3.client(
+            "s3",
+            region_name=profile.aws_region,
+            aws_access_key_id=access_key_id,
+            aws_secret_access_key=secret_access_key,
+            endpoint_url=f"https://s3.{profile.aws_region}.amazonaws.com",
+            config=BotocoreConfig(signature_version="s3v4"),
+        )
+
     def _upload_landing_page_packages(self, profile, console: Console, package_path: Path) -> int:
         """Upload platform-specific packages to S3 for the landing page."""
         import zipfile
@@ -432,15 +478,10 @@ class DistributeCommand(Command):
             console.print("Run 'poetry run ccwb package' first to build packages.")
             return 1
 
-        # Get S3 bucket from distribution stack outputs
-        dist_stack_name = profile.stack_names.get("distribution", f"{profile.identity_pool_name}-distribution")
         try:
-            stack_outputs = get_stack_outputs(dist_stack_name, profile.aws_region)
+            stack_outputs = self._get_distribution_stack_outputs(profile)
             bucket_name = stack_outputs.get("DistributionBucket")
             landing_url = stack_outputs.get("DistributionURL")
-            if not bucket_name:
-                console.print("[red]S3 bucket not found in distribution stack outputs.[/red]")
-                return 1
         except Exception as e:
             console.print(f"[red]Error getting distribution stack outputs: {e}[/red]")
             console.print("Deploy the distribution stack first: poetry run ccwb deploy distribution")
@@ -875,13 +916,9 @@ class DistributeCommand(Command):
             if profile.enable_distribution:
                 # Get S3 bucket from distribution stack outputs
                 progress.update(task, description="Getting S3 bucket information...")
-                dist_stack_name = profile.stack_names.get("distribution", f"{profile.identity_pool_name}-distribution")
                 try:
-                    stack_outputs = get_stack_outputs(dist_stack_name, profile.aws_region)
+                    stack_outputs = self._get_distribution_stack_outputs(profile)
                     bucket_name = stack_outputs.get("DistributionBucket")
-                    if not bucket_name:
-                        console.print("[red]S3 bucket not found in distribution stack outputs.[/red]")
-                        return 1
                 except Exception as e:
                     console.print(f"[red]Error getting distribution stack outputs: {e}[/red]")
                     console.print("Deploy the distribution stack first: poetry run ccwb deploy distribution")
@@ -955,13 +992,19 @@ class DistributeCommand(Command):
             progress.update(task, description="Generating presigned URL...")
             allowed_ips = self.option("allowed-ips")
 
+            try:
+                presign_s3 = self._create_distribution_presign_client(profile, stack_outputs)
+            except Exception as e:
+                console.print(f"[red]Failed to load distribution signing credentials: {e}[/red]")
+                return 1
+
             if allowed_ips:
                 # Generate URL with IP restrictions
-                url = self._generate_restricted_url(s3, bucket_name, package_key, allowed_ips, expires_hours)
+                url = self._generate_restricted_url(presign_s3, bucket_name, package_key, allowed_ips, expires_hours)
             else:
                 # Generate standard presigned URL
                 try:
-                    url = s3.generate_presigned_url(
+                    url = presign_s3.generate_presigned_url(
                         "get_object", Params={"Bucket": bucket_name, "Key": package_key}, ExpiresIn=expires_hours * 3600
                     )
                 except ClientError as e:

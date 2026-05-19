@@ -301,7 +301,8 @@ class InitCommand(Command):
             console.print("(Okta, Auth0, Azure AD, AWS Cognito)")
             console.print("\nWhen disabled:")
             console.print("  • Uses AWS IAM roles for access control")
-            console.print("  • Metrics will use anonymous tracking based on IAM identity")
+            console.print("  • Metrics will try to attribute users from IAM identity when available")
+            console.print("    and fall back to anonymous only when no user-like identity can be derived")
             console.print("  • No user authentication required\n")
 
             sso_enabled = questionary.confirm(
